@@ -1,3 +1,1 @@
-from gym_posture.cli import main
-
-__all__ = ["main"]
+"""AI gym coach: score lifting form from a phone video."""

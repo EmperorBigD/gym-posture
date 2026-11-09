@@ -1,73 +1,99 @@
-"""Command line: analyse a squat video and write the story video + scorecard."""
+"""Analyse a lifting video and write the story video, scorecard and JSON report.
+
+gym-posture squat data/input/squat.mp4 --load 120 --bodyweight 75
+"""
 
 import argparse
 import json
 from pathlib import Path
 
 import cv2
+import numpy as np
 
-from gym_posture.pose import PoseTrack, extract_pose
-from gym_posture.render import LiftInfo, StoryRenderer, clip_frames, scorecard, write_story
-from gym_posture.reps import clean_points, depth_signal, find_reps, shoulder_drop
-from gym_posture.scoring import score_frames, score_rep, score_set
+from gym_posture.core.pose import PoseTrack, extract_pose
+from gym_posture.core.scoring import FrameScores, SetScore
+from gym_posture.core.signals import Rep, clean_points
+from gym_posture.exercises import EXERCISES
+from gym_posture.exercises.base import Exercise, Lift
+from gym_posture.render.overlay import StoryRenderer
+from gym_posture.render.scorecard import scorecard
+from gym_posture.render.video import clip_frames, write_story
 
-DEFAULT_MODEL: Path = Path("models/pose_landmarker_heavy.task")
+OUTPUT_DIR: Path = Path("output")
+CACHE_DIR: Path = OUTPUT_DIR / "cache"
 
 
-def main() -> None:
-    parser: argparse.ArgumentParser = argparse.ArgumentParser(description=__doc__)
+def _parse_args() -> argparse.Namespace:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="gym-posture", description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("exercise", choices=sorted(EXERCISES))
     parser.add_argument("video", type=Path)
-    parser.add_argument("--load", type=float, required=True, help="bar weight in kg")
+    parser.add_argument("--load", type=float, required=True,
+                        help="weight in kg (the bar, or ONE dumbbell)")  # fmt: skip
     parser.add_argument("--bodyweight", type=float, required=True, help="your weight in kg")
-    parser.add_argument("--out", type=Path, default=Path("output"))
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    args: argparse.Namespace = parser.parse_args()
+    parser.add_argument("--out", type=Path, default=OUTPUT_DIR)
+    return parser.parse_args()
 
-    out_dir: Path = args.out
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem: str = Path(args.video).stem
-    cache: Path = out_dir / f"{stem}_pose.npz"
+
+def _load_track(video: Path, exercise: Exercise) -> PoseTrack:
+    """Pose is slow to compute, so it is cached per video and pose model."""
+    cache: Path = CACHE_DIR / f"{video.stem}_{exercise.backend}.npz"
     if cache.exists():
-        track: PoseTrack = PoseTrack.load(cache)
-    else:
-        print("Detecting pose on every frame (a few minutes)...")
-        track = extract_pose(args.video, args.model)
-        track.save(cache)
+        return PoseTrack.load(cache)
+    print(f"Detecting pose on every frame with {exercise.backend} (a few minutes)...")
+    track: PoseTrack = extract_pose(video, exercise.backend)
+    track.save(cache)
+    return track
 
-    points = clean_points(track)
-    depth = depth_signal(points, track.fps)
-    reps = find_reps(depth, shoulder_drop(points, track.fps), track.fps)
-    if not reps:
-        raise SystemExit("No squat reps found in this video.")
-    frames = score_frames(points)
-    result = score_set([score_rep(rep, points, frames, track.fps) for rep in reps])
 
-    lift: LiftInfo = LiftInfo("BACK SQUAT", args.load, args.bodyweight)
-    card = scorecard(result, lift)
-    card_path: Path = out_dir / f"{stem}_scorecard.png"
-    cv2.imwrite(str(card_path), card)
-
-    keep: list[int] = clip_frames([(r.start, r.end) for r in reps], track.fps, len(points))
-    renderer: StoryRenderer = StoryRenderer(points, frames, depth, result, keep, track.fps, lift)
-    video_path: Path = out_dir / f"{stem}_story.mp4"
-    write_story(args.video, video_path, renderer, card)
-
-    report: dict[str, object] = {
+def _report(result: SetScore) -> dict[str, object]:
+    return {
         "overall": round(result.overall, 1),
         "checks": {name: round(value, 1) for name, value in result.checks.items()},
         "reps": [
             {
                 "overall": round(rep.overall, 1),
                 "checks": {name: round(value, 1) for name, value in rep.checks.items()},
-                "depth_gap_thigh": round(rep.depth_gap, 3),
-                "descent_s": round(rep.descent_s, 2),
-                "ascent_s": round(rep.ascent_s, 2),
+                **{name: round(value, 3) for name, value in rep.details.items()},
             }
             for rep in result.reps
         ],
     }
-    report_path: Path = out_dir / f"{stem}_report.json"
-    report_path.write_text(json.dumps(report, indent=2))
+
+
+def main() -> None:
+    args: argparse.Namespace = _parse_args()
+    exercise: Exercise = EXERCISES[args.exercise]
+    video: Path = args.video
+    lift: Lift = Lift(args.load, args.bodyweight, implements=exercise.implements)
+
+    track: PoseTrack = _load_track(video, exercise)
+    points: np.ndarray = clean_points(track)
+    reps: list[Rep] = exercise.find_reps(points, track.fps)
+    if not reps:
+        raise SystemExit(f"No {exercise.slug} reps found in {video}.")
+    frames: FrameScores = exercise.score_frames(points, track.fps)
+    result: SetScore = exercise.score_set(
+        [exercise.score_rep(rep, points, frames, track.fps) for rep in reps]
+    )
+
+    out_dir: Path = args.out / exercise.slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    card: np.ndarray = scorecard(exercise, lift, result)
+    card_path: Path = out_dir / f"{video.stem}_scorecard.png"
+    cv2.imwrite(str(card_path), card)
+
+    keep: list[int] = clip_frames([(r.start, r.end) for r in reps], track.fps, len(points))
+    progress: np.ndarray = exercise.progress(points, track.fps)
+    renderer: StoryRenderer = StoryRenderer(
+        exercise, lift, points, frames, progress, result, keep, track.fps
+    )
+    video_path: Path = out_dir / f"{video.stem}_story.mp4"
+    write_story(video, video_path, renderer, card)
+
+    report_path: Path = out_dir / f"{video.stem}_report.json"
+    report_path.write_text(json.dumps(_report(result), indent=2))
     print(f"Overall form score: {result.overall:.0f}/100 over {len(reps)} reps")
     for path in (video_path, card_path, report_path):
         print(path.resolve())

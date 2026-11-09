@@ -5,7 +5,9 @@ __pycache__/
 .ruff_cache/
 .env
 
-# Large / personal media and generated output
+# Personal videos, downloaded models and generated output
+data/input/*
+!data/input/.gitkeep
 *.mp4
 *.mov
 models/*.task
