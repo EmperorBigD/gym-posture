@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Large / personal media and generated output
+*.mp4
+*.mov
+models/*.task
+output/
